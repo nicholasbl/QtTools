@@ -3,26 +3,12 @@
 #include <QAbstractTableModel>
 #include <QDebug>
 
-template <class H, class T>
-struct MetaMember {
-    using ClassName  = H;
-    using ReturnType = T;
-    T H::*      access;
-    char const* name;
-    bool        editable;
+#include <span>
 
-    constexpr MetaMember(T H::*      _access,
-                         char const* _name,
-                         bool        _editable = false)
-        : access(_access), name(_name), editable(_editable) { }
-};
-
-
-#define MAKE_META(...)                                                         \
-    static constexpr inline auto meta = std::tuple(__VA_ARGS__)
+namespace struct_model_detail {
 
 template <class Tuple, class Function>
-constexpr auto tuple_for_each(Tuple&& t, Function&& f) {
+auto tuple_for_each(Tuple&& t, Function&& f) {
     std::apply([&](auto&... x) { (..., f(x)); }, t);
 }
 
@@ -55,18 +41,11 @@ void tuple_get(Tuple&& t, int index, Function&& f) {
     _get_by_idx<Tuple, S - 1, Function>::check(t, index, std::move(f));
 }
 
-///
-/// \brief Get the fields of a record
-///
+
 template <class Record>
 QStringList get_header() {
     QStringList ret;
-    tuple_for_each(Record::meta, [&ret]<class T>(T const& m) {
-        // make sure we didnt make a mistake in the record
-        static_assert(std::is_same_v<Record, typename T::ClassName>,
-                      "Record has a bad accessor. Check classnames.");
-        ret << m.name;
-    });
+    tuple_for_each(Record::meta, [&ret](auto const& m) { ret << m.name; });
     return ret;
 }
 
@@ -89,6 +68,7 @@ QHash<int, QByteArray> const& get_name_map() {
 template <class Record, class ReturnType>
 constexpr int role_for_member(ReturnType Record::*ptr) {
     // Need to find a nice way to have a compile error on missing meta
+    // this also does not work with custom meta
     int ret       = -1;
     using PtrType = decltype(ptr);
     int i         = 0;
@@ -106,11 +86,30 @@ constexpr int role_for_member(ReturnType Record::*ptr) {
     return ret;
 }
 
+
+template <class T>
+constexpr bool is_qobject = std::is_base_of_v<QObject, std::remove_cvref_t<T>>;
+
+template <class T>
+struct is_shared_qobject {
+    static constexpr bool value = false;
+};
+
+template <class T>
+struct is_shared_qobject<std::shared_ptr<T>> {
+    static constexpr bool value = is_qobject<T>;
+};
+
 template <class Record>
 QVariant record_runtime_get(Record const& r, int i) {
     QVariant ret;
     tuple_get(Record::meta, i, [&r, &ret](auto const& a) {
-        ret = QVariant::fromValue(r.*a.access);
+        using DCL = std::remove_cvref_t<decltype(a.get(r))>;
+        if constexpr (is_shared_qobject<DCL>::value) {
+            ret = QVariant::fromValue((a.get(r)).get());
+        } else {
+            ret = QVariant::fromValue(a.get(r));
+        }
     });
     return ret;
 }
@@ -120,27 +119,71 @@ bool record_runtime_set(Record& r, int i, QVariant const& v) {
     bool ret = false;
 
     tuple_get(Record::meta, i, [&v, &ret, &r](auto& _value) {
-        if (_value.editable) {
-            ret = true;
+        using DCL = std::remove_cvref_t<decltype(_value.get(r))>;
+        if constexpr (is_shared_qobject<DCL>::value) {
+            // editing a shared ptr is not supported at this time
+            qWarning() << "Attempting to write to a shared pointer qobject";
+            ret = false;
+        } else {
+            if (_value.editable) {
+                ret = true;
 
-            using LT = std::remove_cvref_t<decltype(r.*_value.access)>;
-            (r.*_value.access) = v.value<LT>();
+                using LT = std::remove_cvref_t<decltype(_value.get(r))>;
+                _value.set(r, v.value<LT>());
+            }
         }
     });
 
     return ret;
 }
 
+} // namespace struct_model_detail
+
+template <class H, class T>
+struct MetaMember {
+    T H::*      access;
+    char const* name;
+    bool        editable;
+
+    constexpr MetaMember(T H::*      _access,
+                         char const* _name,
+                         bool        _editable = false)
+        : access(_access), name(_name), editable(_editable) { }
+
+    inline T const& get(H const& h) const { return h.*this->access; }
+    inline void     set(H& h, T const& t) const { h.*this->access = t; }
+};
+
+template <class H, class T>
+struct MetaCustom {
+    using Getter = T (*)(H const&);
+    using Setter = void (*)(H&, T&&);
+    Getter      getter;
+    Setter      setter;
+    char const* name;
+    bool        editable;
+
+    constexpr MetaCustom(Getter      _getter,
+                         Setter      _setter,
+                         char const* _name,
+                         bool        _editable = false)
+        : getter(_getter), setter(_setter), name(_name), editable(_editable) { }
+
+    inline T    get(H const& h) const { return std::invoke(getter, h); }
+    inline void set(H& h, T&& t) const { std::invoke(setter, h, std::move(t)); }
+};
+
+#define SM_MAKE_META(...)                                                      \
+    static constexpr inline auto meta = std::tuple(__VA_ARGS__)
+
+#define SM_META(TYPE, NAME) MetaMember(&TYPE ::NAME, #NAME, true)
+
 class StructTableModelBase : public QAbstractTableModel {
     Q_OBJECT
 public:
     using QAbstractTableModel::QAbstractTableModel;
 
-public slots:
-    QVariant get_ui_data(int row, QString name);
-
-signals:
-    void content_changed();
+    // we used this for some virtual stuff. can still do so in future.
 };
 
 template <class Record>
@@ -151,7 +194,8 @@ class StructTableModel : public StructTableModelBase {
 
 public:
     explicit StructTableModel(QObject* parent = nullptr)
-        : StructTableModelBase(parent), m_header(get_header<Record>()) { }
+        : StructTableModelBase(parent),
+          m_header(struct_model_detail::get_header<Record>()) { }
 
     // Header:
     QVariant headerData(int             section,
@@ -176,13 +220,16 @@ public:
     QVariant data(QModelIndex const& index,
                   int                role = Qt::DisplayRole) const override {
 
+        // qDebug() << Q_FUNC_INFO << index << role;
+
         if (!index.isValid()) return {};
         if (index.row() >= m_records.size()) return {};
 
         auto const& item = m_records[index.row()];
 
         if (role == Qt::DisplayRole or role == Qt::EditRole) {
-            return record_runtime_get(item, index.column());
+            return struct_model_detail::record_runtime_get(item,
+                                                           index.column());
         }
 
         if (role >= Qt::UserRole) {
@@ -192,7 +239,7 @@ public:
 
             if (local_role >= m_header.size()) return {};
 
-            return record_runtime_get(item, local_role);
+            return struct_model_detail::record_runtime_get(item, local_role);
         }
 
         return {};
@@ -202,6 +249,8 @@ public:
     bool setData(QModelIndex const& index,
                  QVariant const&    value,
                  int                role = Qt::EditRole) override {
+
+        // qDebug() << Q_FUNC_INFO << index << value << role;
 
         if (data(index, role) == value) return false;
 
@@ -217,14 +266,12 @@ public:
 
         if (location >= m_header.size()) return false;
 
-        bool ok = record_runtime_set(item, location, value);
-
-        qDebug() << Q_FUNC_INFO << index << value << role << ok;
+        bool ok =
+            struct_model_detail::record_runtime_set(item, location, value);
 
         if (!ok) return false;
 
         emit dataChanged(index, index, QList<int>() << role);
-        emit content_changed();
         return true;
     }
 
@@ -233,9 +280,10 @@ public:
 
         bool can_edit = false;
 
-        tuple_get(Record::meta, index.column(), [&can_edit](auto const& v) {
-            can_edit = v.editable;
-        });
+        struct_model_detail::tuple_get(
+            Record::meta, index.column(), [&can_edit](auto const& v) {
+                can_edit = v.editable;
+            });
 
         if (!can_edit) return Qt::ItemIsEnabled;
 
@@ -243,25 +291,48 @@ public:
     }
 
     QHash<int, QByteArray> roleNames() const override {
-        static const auto roles = get_name_map<Record>();
+        static const auto roles = struct_model_detail::get_name_map<Record>();
 
         return roles;
     }
 
+    bool insertRows(int                row,
+                    int                count,
+                    QModelIndex const& p = QModelIndex()) override {
+        if (row < 0 or count <= 0) return false;
+
+        beginInsertRows(p, row, row + count - 1);
+        m_records.insert(row, count, Record {});
+        endInsertRows();
+        return true;
+    }
+
+    bool removeRows(int                row,
+                    int                count,
+                    QModelIndex const& p = QModelIndex()) override {
+        if (row < 0 or count <= 0) return false;
+        if (count > m_records.size()) return false;
+
+        beginRemoveRows(p, row, row + count - 1);
+        m_records.remove(row, count);
+        endRemoveRows();
+        return true;
+    }
+
+    void reset(QList<Record> new_records = {}) {
+        // qDebug() << Q_FUNC_INFO;
+        beginResetModel();
+        m_records = new_records;
+        endResetModel();
+    }
+
     // this emits a remove signal, instead of a reset
     void remove_all() {
+        // qDebug() << Q_FUNC_INFO;
         if (m_records.isEmpty()) return;
         beginRemoveRows(QModelIndex(), 0, std::max(rowCount() - 1, 0));
         m_records.clear();
         endRemoveRows();
-        emit content_changed();
-    }
-
-    void reset(QList<Record> new_records = {}) {
-        beginResetModel();
-        m_records = new_records;
-        endResetModel();
-        emit content_changed();
     }
 
     Record const* get_at(int i) const {
@@ -275,7 +346,6 @@ public:
         beginInsertRows({}, rc, rc);
         m_records << r;
         endInsertRows();
-        emit content_changed();
     }
 
     auto append(QVector<Record> r) {
@@ -284,7 +354,6 @@ public:
         beginInsertRows({}, rc, rc + r.size() - 1);
         m_records << r;
         endInsertRows();
-        emit content_changed();
     }
 
     auto replace(QVector<Record> r = {}) {
@@ -292,19 +361,11 @@ public:
         append(r);
     }
 
-    void remove_at(int i) {
+    auto update(int i, Record const& r) {
+        // qDebug() << Q_FUNC_INFO;
+
         if (i < 0) return;
         if (i >= m_records.size()) return;
-
-        beginRemoveRows(QModelIndex(), i, i);
-        m_records.remove(i);
-        endRemoveRows();
-        emit content_changed();
-    }
-
-    bool set_at(int i, Record const& r) {
-        if (i < 0) return false;
-        if (i >= m_records.size()) return false;
 
         m_records[i] = r;
 
@@ -312,41 +373,43 @@ public:
         auto right = index(i, columnCount() - 1);
 
         emit dataChanged(left, right);
-        emit content_changed();
-        return true;
     }
 
-    template <class Function>
-    void update_at(int i, Function&& f) {
-        auto* ptr = get_at(i);
-        if (ptr) {
-            Record r = *ptr;
-            f(r);
-            set_at(i, r);
+    void remove_at(int index, int count = 1) {
+        if (index < 0) return;
+        if (index >= m_records.size()) return;
+
+        beginRemoveRows(QModelIndex(), index, index + count - 1);
+        m_records.remove(index, count);
+        endRemoveRows();
+    }
+
+    void insert_at(int index, std::span<Record> records) {
+        qDebug() << Q_FUNC_INFO << index << (m_records.size());
+        if (records.empty()) return;
+        beginInsertRows({}, index, index + records.size() - 1);
+        m_records.insert(index, records.size(), Record {});
+        for (int i = 0; i < records.size(); i++) {
+            m_records[index + i] = records[i];
         }
-        emit content_changed();
+        endInsertRows();
     }
 
-    template <class Function>
-    void update_all(Function&& f) {
-        if (m_records.isEmpty()) return;
 
-        for (auto i = 0; i < rowCount(); i++) {
-            Record& r = m_records[i];
-            f(r, i);
+    // delete by a predicate
+    template <class Function>
+    void remove_by_predicate(Function&& f) {
+        QVector<int> to_remove;
+
+        for (int i = 0; i < m_records.size(); i++) {
+            if (f(m_records[i])) to_remove << i;
         }
-        auto left  = index(0, 0);
-        auto right = index(rowCount() - 1, columnCount() - 1);
 
-        emit dataChanged(left, right);
-        emit content_changed();
-    }
+        // sort to high -> low, so indices are preserved
+        std::reverse(to_remove.begin(), to_remove.end());
 
-    template <class Function>
-    void enumerate(Function&& f) {
-        for (auto i = 0; i < rowCount(); i++) {
-            Record const& r = m_records[i];
-            f(r, i);
+        for (auto i : to_remove) {
+            remove_at(i);
         }
     }
 
@@ -354,4 +417,7 @@ public:
 
     auto begin() const { return m_records.begin(); }
     auto end() const { return m_records.end(); }
+
+    auto cbegin() const { return m_records.begin(); }
+    auto cend() const { return m_records.end(); }
 };
